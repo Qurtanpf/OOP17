@@ -1,0 +1,310 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Sockets;
+using System.Net;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace ChatApp
+{
+    public static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
+        }
+    }
+
+    public class MainForm : Form
+    {
+        private TextBox messageTextBox;
+        private ListBox messagesListBox;
+        private Button sendButton;
+        private Button connectButton;
+        private TcpClient client;
+        private NetworkStream stream;
+        private string userName;
+        private Thread receiveThread;
+        private ServerObject server;
+        private Thread listenThread;
+
+        public MainForm()
+        {
+            InitializeComponents();
+        }
+
+        private void InitializeComponents()
+        {
+            this.messageTextBox = new TextBox();
+            this.messagesListBox = new ListBox();
+            this.sendButton = new Button();
+            this.connectButton = new Button();
+
+            this.messageTextBox.Location = new System.Drawing.Point(12, 330);
+            this.messageTextBox.Size = new System.Drawing.Size(360, 20);
+
+            this.messagesListBox.Location = new System.Drawing.Point(12, 12);
+            this.messagesListBox.Size = new System.Drawing.Size(360, 300);
+
+            this.sendButton.Location = new System.Drawing.Point(380, 330);
+            this.sendButton.Size = new System.Drawing.Size(75, 23);
+            this.sendButton.Text = "Send";
+            this.sendButton.Click += new EventHandler(this.SendButton_Click);
+
+            this.connectButton.Location = new System.Drawing.Point(380, 12);
+            this.connectButton.Size = new System.Drawing.Size(75, 23);
+            this.connectButton.Text = "Connect";
+            this.connectButton.Click += new EventHandler(this.ConnectButton_Click);
+
+            this.Controls.Add(this.messageTextBox);
+            this.Controls.Add(this.messagesListBox);
+            this.Controls.Add(this.sendButton);
+            this.Controls.Add(this.connectButton);
+
+            this.Text = "Chat App";
+            this.Size = new System.Drawing.Size(480, 400);
+        }
+
+        private void ConnectButton_Click(object sender, EventArgs e)
+        {
+            userName = Prompt.ShowDialog("Enter your name:", "Name");
+            client = new TcpClient();
+            try
+            {
+                client.Connect("127.0.0.1", 8888); // підключення клієнта
+                stream = client.GetStream(); // отримуємо потік
+                string message = userName;
+                byte[] data = Encoding.Unicode.GetBytes(message);
+                stream.Write(data, 0, data.Length);
+
+                receiveThread = new Thread(new ThreadStart(ReceiveMessage));
+                receiveThread.Start();
+                messagesListBox.Items.Add("Welcome, " + userName);
+
+                connectButton.Enabled = false;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message);
+            }
+        }
+
+        private void SendButton_Click(object sender, EventArgs e)
+        {
+            SendMessage();
+        }
+
+        private void SendMessage()
+        {
+            string message = messageTextBox.Text;
+            if (!string.IsNullOrWhiteSpace(message))
+            {
+                byte[] data = Encoding.Unicode.GetBytes(message);
+                stream.Write(data, 0, data.Length);
+                messageTextBox.Clear();
+            }
+        }
+
+        private void ReceiveMessage()
+        {
+            while (true)
+            {
+                try
+                {
+                    byte[] data = new byte[64];
+                    StringBuilder builder = new StringBuilder();
+                    int bytes = 0;
+                    do
+                    {
+                        bytes = stream.Read(data, 0, data.Length);
+                        builder.Append(Encoding.Unicode.GetString(data, 0, bytes));
+                    }
+                    while (stream.DataAvailable);
+
+                    string message = builder.ToString();
+                    Invoke((MethodInvoker)(() => messagesListBox.Items.Add(message)));
+                }
+                catch
+                {
+                    MessageBox.Show("Connection interrupted!");
+                    Disconnect();
+                    break;
+                }
+            }
+        }
+
+        private void Disconnect()
+        {
+            if (stream != null)
+                stream.Close();
+            if (client != null)
+                client.Close();
+            Environment.Exit(0);
+        }
+    }
+
+    public class ServerObject
+    {
+        static TcpListener tcpListener;
+        List<ClientObject> clients = new List<ClientObject>();
+
+        protected internal void AddConnection(ClientObject clientObject)
+        {
+            clients.Add(clientObject);
+        }
+
+        protected internal void RemoveConnection(string id)
+        {
+            ClientObject client = clients.FirstOrDefault(c => c.Id == id);
+            if (client != null)
+                clients.Remove(client);
+        }
+
+        protected internal void Listen()
+        {
+            try
+            {
+                tcpListener = new TcpListener(IPAddress.Any, 8888);
+                tcpListener.Start();
+                while (true)
+                {
+                    TcpClient tcpClient = tcpListener.AcceptTcpClient();
+                    ClientObject clientObject = new ClientObject(tcpClient, this);
+                    Thread clientThread = new Thread(new ThreadStart(clientObject.Process));
+                    clientThread.Start();
+                }
+            }
+            catch (Exception ex)
+            {
+                Disconnect();
+            }
+        }
+
+        protected internal void BroadcastMessage(string message, string id)
+        {
+            byte[] data = Encoding.Unicode.GetBytes(message);
+            for (int i = 0; i < clients.Count; i++)
+            {
+                if (clients[i].Id != id)
+                {
+                    clients[i].Stream.Write(data, 0, data.Length);
+                }
+            }
+        }
+
+        protected internal void Disconnect()
+        {
+            tcpListener.Stop();
+            for (int i = 0; i < clients.Count; i++)
+            {
+                clients[i].Close();
+            }
+            Environment.Exit(0);
+        }
+    }
+
+    public class ClientObject
+    {
+        protected internal string Id { get; private set; }
+        protected internal NetworkStream Stream { get; private set; }
+        string userName;
+        TcpClient client;
+        ServerObject server;
+
+        public ClientObject(TcpClient tcpClient, ServerObject serverObject)
+        {
+            Id = Guid.NewGuid().ToString();
+            client = tcpClient;
+            server = serverObject;
+            serverObject.AddConnection(this);
+        }
+
+        public void Process()
+        {
+            try
+            {
+                Stream = client.GetStream();
+                string message = GetMessage();
+                userName = message;
+                message = userName + " вошел в чат";
+                server.BroadcastMessage(message, this.Id);
+
+                while (true)
+                {
+                    try
+                    {
+                        message = GetMessage();
+                        message = String.Format("{0}: {1}", userName, message);
+                        server.BroadcastMessage(message, this.Id);
+                    }
+                    catch
+                    {
+                        message = String.Format("{0}: покинул чат", userName);
+                        server.BroadcastMessage(message, this.Id);
+                        break;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+            }
+            finally
+            {
+                server.RemoveConnection(this.Id);
+                Close();
+            }
+        }
+
+        private string GetMessage()
+        {
+            byte[] data = new byte[64];
+            StringBuilder builder = new StringBuilder();
+            int bytes = 0;
+            do
+            {
+                bytes = Stream.Read(data, 0, data.Length);
+                builder.Append(Encoding.Unicode.GetString(data, 0, bytes));
+            }
+            while (Stream.DataAvailable);
+            return builder.ToString();
+        }
+
+        protected internal void Close()
+        {
+            if (Stream != null)
+                Stream.Close();
+            if (client != null)
+                client.Close();
+        }
+    }
+
+    public static class Prompt
+    {
+        public static string ShowDialog(string text, string caption)
+        {
+            Form prompt = new Form()
+            {
+                Width = 300,
+                Height = 150,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                Text = caption,
+                StartPosition = FormStartPosition.CenterScreen
+            };
+            Label textLabel = new Label() { Left = 50, Top = 20, Text = text };
+            TextBox textBox = new TextBox() { Left = 50, Top = 50, Width = 200 };
+            Button confirmation = new Button() { Text = "Ok", Left = 150, Width = 100, Top = 70, DialogResult = DialogResult.OK };
+            confirmation.Click += (sender, e) => { prompt.Close(); };
+            prompt.Controls.Add(textBox);
+            prompt.Controls.Add(confirmation);
+            prompt.Controls.Add(textLabel);
+            prompt.AcceptButton = confirmation;
+
+            return prompt.ShowDialog() == DialogResult.OK ? textBox.Text : "";
+        }
+    }
+}
